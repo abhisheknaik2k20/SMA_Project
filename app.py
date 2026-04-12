@@ -1,651 +1,1053 @@
 """
-app.py
-──────
-Streamlit dashboard for the Privacy Perception Study.
-
-On first launch  → runs full pipeline (Supabase fetch + compute) → saves to disk
-On every later launch → loads saved results from disk, NO DB/compute work done
+Privacy Perception Study — Streamlit Dashboard v2
+==================================================
+• Checks for cached JSON data in ./pipeline_cache/
+• If no cache: shows pipeline runner UI with config options
+• If cache found: renders full multimodal analytics dashboard
 """
 
+import streamlit as st
+import json
 import os
 import sys
-import datetime
-from pathlib import Path
-
+import subprocess
+import time
 import numpy as np
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
-
-sys.path.insert(0, str(Path(__file__).parent))
-from cache_manager import cache_exists, load_cache, clear_cache, cache_info
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+from pathlib import Path
+from datetime import datetime
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
-
 st.set_page_config(
-    page_title="Privacy Perception Study",
-    page_icon="🔐",
+    page_title="Privacy Perception Study — Dashboard",
+    page_icon="🔒",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# THEME / CSS
+# ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    .stApp { background-color: #0D1117; }
-    .main .block-container { padding-top: 1.5rem; max-width: 1400px; }
-    .metric-card {
-        background: #161B22; border: 1px solid #30363D;
-        border-radius: 10px; padding: 1rem 1.2rem;
-        text-align: center; margin-bottom: 0.4rem;
-    }
-    .metric-card .label {
-        font-size: 0.72rem; color: #8B949E;
-        text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 0.25rem;
-    }
-    .metric-card .value { font-size: 1.9rem; font-weight: 700; color: #E6EDF3; }
-    .metric-card .delta { font-size: 0.78rem; color: #4ECDC4; margin-top: 0.15rem; }
-    .section-header {
-        background: linear-gradient(90deg,#FF6B6B22 0%,transparent 100%);
-        border-left: 3px solid #FF6B6B; padding: 0.45rem 0.9rem;
-        border-radius: 0 6px 6px 0; margin: 1rem 0 0.7rem 0;
-        color: #E6EDF3; font-weight: 600; font-size: 1rem;
-    }
-    .cache-badge {
-        display:inline-block; background:#238636; color:#fff;
-        border-radius:12px; padding:2px 12px; font-size:0.75rem; font-weight:600;
-    }
-    .nocache-badge {
-        display:inline-block; background:#DA3633; color:#fff;
-        border-radius:12px; padding:2px 12px; font-size:0.75rem; font-weight:600;
-    }
-    section[data-testid="stSidebar"] { background-color: #161B22; }
-    .stTabs [data-baseweb="tab-list"] { background-color:#161B22; border-radius:8px; }
-    .stTabs [data-baseweb="tab"] { color:#8B949E; }
-    .stTabs [data-baseweb="tab"][aria-selected="true"] { color:#E6EDF3; }
-    .log-box {
-        background:#0D1117; border:1px solid #30363D; border-radius:8px;
-        padding:1rem; font-family:monospace; font-size:0.78rem;
-        color:#4ECDC4; max-height:320px; overflow-y:auto; white-space:pre-wrap;
-    }
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+  :root {
+    --bg:        #0D1117;
+    --surface:   #161B22;
+    --border:    #30363D;
+    --fg:        #E6EDF3;
+    --muted:     #8B949E;
+    --accent:    #FF6B6B;
+    --teal:      #4ECDC4;
+    --gold:      #FFE66D;
+    --purple:    #C77DFF;
+  }
+
+  html, body, [data-testid="stAppViewContainer"] {
+    background: var(--bg) !important;
+    color: var(--fg) !important;
+    font-family: 'DM Sans', sans-serif;
+  }
+  [data-testid="stSidebar"] {
+    background: var(--surface) !important;
+    border-right: 1px solid var(--border);
+  }
+  .block-container { padding: 1.5rem 2rem; }
+
+  /* ── Cards ── */
+  .metric-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.2rem 1.5rem;
+    text-align: center;
+    transition: border-color 0.2s;
+  }
+  .metric-card:hover { border-color: var(--teal); }
+  .metric-value {
+    font-family: 'Space Mono', monospace;
+    font-size: 2rem;
+    font-weight: 700;
+    color: var(--teal);
+    line-height: 1.1;
+  }
+  .metric-label {
+    font-size: 0.75rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-top: 0.3rem;
+  }
+
+  /* ── Section headers ── */
+  .section-header {
+    font-family: 'Space Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.4rem;
+    margin: 1.5rem 0 1rem 0;
+  }
+
+  /* ── Hero banner ── */
+  .hero {
+    background: linear-gradient(135deg, #161B22 0%, #0D1117 60%, #1a0a0a 100%);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 2rem 2.5rem;
+    margin-bottom: 1.5rem;
+    position: relative;
+    overflow: hidden;
+  }
+  .hero::before {
+    content: "🔒";
+    position: absolute;
+    right: 2rem;
+    top: 1rem;
+    font-size: 5rem;
+    opacity: 0.07;
+  }
+  .hero h1 {
+    font-family: 'Space Mono', monospace;
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--fg);
+    margin: 0 0 0.4rem 0;
+  }
+  .hero p { color: var(--muted); font-size: 0.9rem; margin: 0; }
+  .hero .badge {
+    display: inline-block;
+    background: rgba(78,205,196,0.15);
+    border: 1px solid var(--teal);
+    color: var(--teal);
+    border-radius: 20px;
+    font-size: 0.7rem;
+    font-family: 'Space Mono', monospace;
+    padding: 0.2rem 0.75rem;
+    margin: 0.6rem 0.3rem 0 0;
+  }
+
+  /* ── Run pipeline UI ── */
+  .run-panel {
+    background: var(--surface);
+    border: 2px dashed var(--border);
+    border-radius: 14px;
+    padding: 3rem;
+    text-align: center;
+  }
+  .run-icon { font-size: 4rem; margin-bottom: 1rem; }
+  .run-title {
+    font-family: 'Space Mono', monospace;
+    font-size: 1.3rem;
+    color: var(--fg);
+    margin-bottom: 0.5rem;
+  }
+  .run-sub { color: var(--muted); font-size: 0.85rem; margin-bottom: 2rem; }
+
+  /* ── Tables ── */
+  .stDataFrame { border: 1px solid var(--border) !important; border-radius: 8px; }
+
+  /* ── Status tags ── */
+  .tag-high  { background: rgba(255,107,107,0.15); color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0.1rem 0.5rem; font-size: 0.75rem; font-family: 'Space Mono', monospace; }
+  .tag-low   { background: rgba(78,205,196,0.15); color: var(--teal); border: 1px solid var(--teal); border-radius: 4px; padding: 0.1rem 0.5rem; font-size: 0.75rem; font-family: 'Space Mono', monospace; }
+  .tag-mid   { background: rgba(255,230,109,0.15); color: var(--gold); border: 1px solid var(--gold); border-radius: 4px; padding: 0.1rem 0.5rem; font-size: 0.75rem; font-family: 'Space Mono', monospace; }
+
+  /* Hide Streamlit default elements */
+  #MainMenu {visibility: hidden;}
+  footer {visibility: hidden;}
+  .stDeployButton {display: none;}
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
+CACHE_DIR  = Path("pipeline_cache")
+CACHE_FILE = CACHE_DIR / "results.json"
+META_FILE  = CACHE_DIR / "meta.json"
 
-AGE_ORDER = ["18 - 24", "25 - 34", "35 - 44", "45 - 54", "55 - 64", "65 or older"]
-GENRE_RISK_PRIOR = {
-    "News & Politics": 0.75, "Education": 0.45, "Entertainment": 0.55,
-    "Gaming": 0.50, "Music": 0.40, "Science & Technology": 0.60,
-    "Health": 0.70, "Finance": 0.80, "Travel": 0.65, "Food": 0.35,
-    "Sports": 0.45, "Fashion & Beauty": 0.50, "Lifestyle": 0.55,
-    "Comedy": 0.40, "Other": 0.50,
-}
-BG   = "#0D1117"
-CARD = "#161B22"
-RED  = "#FF6B6B"
+BG_COLOR = "#0D1117"
+SURF_COLOR = "#161B22"
+FG_COLOR = "#E6EDF3"
+ACCENT = "#FF6B6B"
 TEAL = "#4ECDC4"
-YELL = "#FFE66D"
-PURP = "#C77DFF"
-TMPL = "plotly_dark"
-
-NEEDED_KEYS = ["survey", "comments", "affinity_mat",
-               "genre_pii", "risk_matrix", "model_results"]
-
-def all_cached() -> bool:
-    return all(cache_exists(k) for k in NEEDED_KEYS)
-
+GOLD = "#FFE66D"
+PURPLE = "#C77DFF"
+MUTED = "#8B949E"
+BORDER = "#30363D"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOAD FROM DISK  (one Streamlit resource cache per session)
+# CACHE HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-@st.cache_resource(show_spinner=False)
-def load_all_from_cache():
-    return {
-        "survey":        load_cache("survey"),
-        "comments":      load_cache("comments"),
-        "affinity_mat":  load_cache("affinity_mat"),
-        "affinity_df":   load_cache("affinity_df"),
-        "genre_pii":     load_cache("genre_pii"),
-        "risk_matrix":   load_cache("risk_matrix"),
-        "model_results": load_cache("model_results") or {},
+def cache_exists() -> bool:
+    return CACHE_FILE.exists() and CACHE_FILE.stat().st_size > 100
+
+
+def load_cache() -> dict:
+    with open(CACHE_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_cache(data: dict):
+    CACHE_DIR.mkdir(exist_ok=True)
+    # Serialise numpy/pandas objects
+    def serialise(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, pd.DataFrame):
+            return obj.to_dict(orient="records")
+        if isinstance(obj, pd.Series):
+            return obj.to_dict()
+        if isinstance(obj, (np.integer, np.floating)):
+            return float(obj)
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        raise TypeError(f"Not serialisable: {type(obj)}")
+
+    with open(CACHE_FILE, "w") as f:
+        json.dump(data, f, default=serialise, indent=2)
+
+    with open(META_FILE, "w") as f:
+        json.dump({
+            "created_at": datetime.now().isoformat(),
+            "version": "v2",
+        }, f)
+
+
+def load_meta() -> dict:
+    if META_FILE.exists():
+        with open(META_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def clear_cache():
+    if CACHE_FILE.exists():
+        CACHE_FILE.unlink()
+    if META_FILE.exists():
+        META_FILE.unlink()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MOCK DATA GENERATOR (for demo when no Supabase)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_mock_results() -> dict:
+    """Generate realistic mock data so the dashboard can be demoed standalone."""
+    rng = np.random.default_rng(42)
+
+    genres = [
+        "Finance", "Health", "News & Politics", "Science & Technology",
+        "Travel", "Education", "Entertainment", "Gaming",
+        "Music", "Food", "Sports", "Comedy", "Fashion & Beauty", "Lifestyle"
+    ]
+    age_groups = ["18 - 24", "25 - 34", "35 - 44", "45 - 54", "55 - 64", "65 or older"]
+
+    # Genre PII profile
+    risk_prior = {
+        "Finance": 0.80, "Health": 0.70, "News & Politics": 0.75,
+        "Science & Technology": 0.60, "Travel": 0.65, "Education": 0.45,
+        "Entertainment": 0.55, "Gaming": 0.50, "Music": 0.40,
+        "Food": 0.35, "Sports": 0.45, "Comedy": 0.40,
+        "Fashion & Beauty": 0.50, "Lifestyle": 0.55,
     }
+    genre_pii_profile = []
+    for g in genres:
+        rp = risk_prior[g]
+        genre_pii_profile.append({
+            "genre_name": g,
+            "n_comments": int(rng.integers(200, 2000)),
+            "avg_pii_count": round(float(rng.uniform(0.1, 2.5) * rp), 3),
+            "avg_sensitivity": round(float(rng.uniform(0.2, 0.8) * rp), 3),
+            "avg_risk_score": round(float(rng.uniform(0.5, 3.5) * rp), 3),
+            "pii_rate": round(float(rng.uniform(0.05, 0.45) * rp + 0.02), 3),
+            "financial_pii_rate": round(float(rng.uniform(0, 0.2) * rp), 3),
+            "contact_pii_rate": round(float(rng.uniform(0, 0.15) * rp), 3),
+            "identity_pii_rate": round(float(rng.uniform(0.05, 0.35) * rp), 3),
+            "relational_pii_rate": round(float(rng.uniform(0, 0.12)), 3),
+            "avg_sentiment": round(float(rng.uniform(-0.4, 0.8)), 3),
+            "avg_pii_density": round(float(rng.uniform(0.01, 0.5) * rp), 4),
+            "risk_prior": rp,
+            "genre_risk_index": round(float(rp * 0.7 + rng.uniform(0, 0.3)), 4),
+        })
+
+    # Genre × Age risk matrix
+    genre_age_risk = {}
+    for g in genres:
+        row = {}
+        for ag in age_groups:
+            base = risk_prior[g]
+            age_mod = [0.1, 0.05, 0.0, -0.05, -0.08, -0.12][age_groups.index(ag)]
+            row[ag] = round(float(np.clip(base + age_mod + rng.uniform(-0.1, 0.1), 0, 1)), 4)
+        genre_age_risk[g] = row
+
+    # Genre × Age affinity matrix
+    genre_age_affinity = {}
+    for g in genres:
+        row = {}
+        weights = rng.dirichlet(np.ones(len(age_groups)) * 2)
+        for i, ag in enumerate(age_groups):
+            row[ag] = round(float(weights[i]), 4)
+        genre_age_affinity[g] = row
+
+    # Model metrics
+    metrics = {
+        "auc_roc": round(float(rng.uniform(0.72, 0.88)), 4),
+        "precision": round(float(rng.uniform(0.65, 0.82)), 4),
+        "recall": round(float(rng.uniform(0.60, 0.80)), 4),
+        "f1": round(float(rng.uniform(0.62, 0.81)), 4),
+    }
+
+    # Feature importances
+    feature_names = [
+        "concern_index", "genre_risk_index", "behaviour_gap",
+        "literacy_enc", "age_enc", "edu_enc", "genre_pii_rate",
+        "q12_concern_data_use", "has_youtube", "genre_fin_pii_rate",
+        "uses_personalization", "privacy_gap_bin",
+    ]
+    importances_raw = rng.dirichlet(np.ones(len(feature_names)) * 1.5)
+    feature_importances = {k: round(float(v), 5)
+                           for k, v in zip(feature_names, importances_raw)}
+
+    # Causal summary
+    causal_summary = []
+    for g in genres:
+        att = round(float(rng.uniform(-0.3, 0.8) * risk_prior[g] - 0.1), 4)
+        p = round(float(rng.uniform(0, 0.2) if abs(att) > 0.1 else rng.uniform(0.05, 0.5)), 4)
+        causal_summary.append({
+            "genre": g,
+            "att": att,
+            "p_value": p,
+            "n_matched": int(rng.integers(30, 300)),
+        })
+
+    # Longitudinal evolution
+    n_users = 120
+    evolution = []
+    for i in range(n_users):
+        slope = float(rng.normal(0.001, 0.003))
+        p = float(rng.uniform(0, 0.15) if abs(slope) > 0.002 else rng.uniform(0.05, 0.6))
+        evolution.append({
+            "user_id": f"user_{i:04d}",
+            "n_waves": int(rng.integers(2, 5)),
+            "concern_slope": round(slope, 6),
+            "concern_r2": round(float(rng.uniform(0.1, 0.8)), 4),
+            "concern_p_value": round(p, 4),
+            "behaviour_gap_slope": round(float(rng.normal(0, 0.002)), 6),
+            "behaviour_gap_r2": round(float(rng.uniform(0.05, 0.6)), 4),
+            "learning": slope > 0 and p < 0.05,
+            "forgetting": slope < 0 and p < 0.05,
+        })
+
+    # Survey summary stats
+    n_survey = 342
+    survey_summary = {
+        "n_respondents": n_survey,
+        "high_risk_rate": round(float(rng.uniform(0.32, 0.48)), 3),
+        "avg_concern_index": round(float(rng.uniform(2.8, 3.8)), 3),
+        "avg_behaviour_gap": round(float(rng.uniform(0.5, 1.8)), 3),
+        "has_youtube_pct": round(float(rng.uniform(0.68, 0.88)), 3),
+        "age_distribution": {ag: int(rng.integers(20, 80)) for ag in age_groups},
+    }
+
+    # Text feature summary
+    text_summary = {
+        "total_comments": int(rng.integers(8000, 25000)),
+        "total_pii_hits": int(rng.integers(1200, 5000)),
+        "relational_pii_count": int(rng.integers(80, 400)),
+        "avg_pii_per_comment": round(float(rng.uniform(0.08, 0.35)), 4),
+    }
+
+    return {
+        "genre_pii_profile": genre_pii_profile,
+        "genre_age_risk": genre_age_risk,
+        "genre_age_affinity": genre_age_affinity,
+        "metrics": metrics,
+        "feature_importances": feature_importances,
+        "causal_summary": causal_summary,
+        "evolution": evolution,
+        "survey_summary": survey_summary,
+        "text_summary": text_summary,
+        "modality_weights": {"text": 0.64, "metadata": 0.24, "image": 0.12},
+        "_generated": "mock",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PIPELINE RUNNER (calls the pipeline script)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_pipeline_and_cache(supabase_url, supabase_key, flags):
+    """Runs the pipeline inline (imports pipeline module) and saves results."""
+    import importlib.util, traceback
+
+    pipeline_path = Path("pipeline_v2.py")
+    if not pipeline_path.exists():
+        st.error("pipeline_v2.py not found in the current directory.")
+        return None
+
+    try:
+        spec   = importlib.util.spec_from_file_location("pipeline_v2", pipeline_path)
+        mod    = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        pipeline = mod.MultimodalPrivacyPipelineV2(
+            supabase_url     = supabase_url,
+            supabase_key     = supabase_key,
+            run_pii          = flags.get("run_pii", True),
+            run_image        = flags.get("run_image", False),
+            run_longitudinal = flags.get("run_longitudinal", True),
+            run_causal       = flags.get("run_causal", True),
+            run_sota_pii     = flags.get("run_sota_pii", True),
+            run_validation   = flags.get("run_validation", True),
+            save_plots       = False,
+        )
+        results = pipeline.run()
+
+        # Extract serialisable subset for cache
+        cache_data = {}
+
+        if "genre_pii_profile" in results and not results["genre_pii_profile"].empty:
+            cache_data["genre_pii_profile"] = results["genre_pii_profile"].to_dict("records")
+
+        if "genre_age_risk" in results and not results["genre_age_risk"].empty:
+            cache_data["genre_age_risk"] = results["genre_age_risk"].to_dict()
+
+        if "genre_age_affinity" in results and not results["genre_age_affinity"].empty:
+            cache_data["genre_age_affinity"] = results["genre_age_affinity"].to_dict()
+
+        cache_data["metrics"] = results.get("metrics", {})
+        cache_data["modality_weights"] = results.get("modality_weights", {})
+
+        analyser = results.get("analyser")
+        if analyser and analyser.feature_importances_ is not None:
+            cache_data["feature_importances"] = analyser.feature_importances_.to_dict()
+
+        if "causal_summary" in results and not results["causal_summary"].empty:
+            cache_data["causal_summary"] = results["causal_summary"].to_dict("records")
+
+        if "evolution" in results and not results["evolution"].empty:
+            cache_data["evolution"] = results["evolution"].to_dict("records")
+
+        # Survey stats
+        survey = results.get("survey", pd.DataFrame())
+        if not survey.empty:
+            cache_data["survey_summary"] = {
+                "n_respondents": len(survey),
+                "high_risk_rate": float(survey["risk_label"].mean()) if "risk_label" in survey.columns else 0,
+                "avg_concern_index": float(survey["concern_index"].mean()) if "concern_index" in survey.columns else 0,
+                "avg_behaviour_gap": float(survey["behaviour_gap"].mean()) if "behaviour_gap" in survey.columns else 0,
+                "has_youtube_pct": float(survey["has_youtube"].mean()) if "has_youtube" in survey.columns else 0,
+            }
+
+        tf = results.get("text_features", pd.DataFrame())
+        if not tf.empty:
+            cache_data["text_summary"] = {
+                "total_comments": len(tf),
+                "total_pii_hits": int(tf["pii_count"].sum()),
+                "relational_pii_count": int(tf["has_relational_pii"].sum()) if "has_relational_pii" in tf.columns else 0,
+                "avg_pii_per_comment": float(tf["pii_count"].mean()),
+            }
+
+        save_cache(cache_data)
+        return cache_data
+
+    except Exception as e:
+        st.error(f"Pipeline error: {e}")
+        st.code(traceback.format_exc())
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLOT HELPERS (dark-theme matplotlib)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def dark_fig(w=12, h=5):
+    fig, ax = plt.subplots(figsize=(w, h))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(SURF_COLOR)
+    for spine in ax.spines.values():
+        spine.set_edgecolor(BORDER)
+    ax.tick_params(colors=MUTED)
+    ax.xaxis.label.set_color(MUTED)
+    ax.yaxis.label.set_color(MUTED)
+    ax.title.set_color(FG_COLOR)
+    ax.grid(True, color=BORDER, alpha=0.4, linewidth=0.5)
+    return fig, ax
+
+
+def dark_fig_multi(nrows=1, ncols=2, w=14, h=5):
+    fig, axes = plt.subplots(nrows, ncols, figsize=(w, h))
+    fig.patch.set_facecolor(BG_COLOR)
+    axlist = axes.flat if hasattr(axes, "flat") else [axes]
+    for ax in axlist:
+        ax.set_facecolor(SURF_COLOR)
+        for spine in ax.spines.values():
+            spine.set_edgecolor(BORDER)
+        ax.tick_params(colors=MUTED)
+        ax.xaxis.label.set_color(MUTED)
+        ax.yaxis.label.set_color(MUTED)
+        ax.title.set_color(FG_COLOR)
+        ax.grid(True, color=BORDER, alpha=0.4, linewidth=0.5)
+    return fig, axes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DASHBOARD SECTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_kpis(data: dict):
+    ss = data.get("survey_summary", {})
+    ts = data.get("text_summary", {})
+    m  = data.get("metrics", {})
+    ev = data.get("evolution", [])
+
+    n_learn = sum(1 for e in ev if e.get("learning"))
+    learn_pct = f"{n_learn/len(ev)*100:.0f}%" if ev else "—"
+
+    kpis = [
+        (ss.get("n_respondents", "—"), "Survey Respondents"),
+        (f"{ss.get('high_risk_rate', 0)*100:.1f}%", "High-Risk Rate"),
+        (f"{ss.get('avg_concern_index', 0):.2f}", "Avg Concern Index"),
+        (f"{ts.get('total_pii_hits', '—'):,}" if isinstance(ts.get("total_pii_hits"), int) else "—", "Total PII Hits"),
+        (f"{m.get('auc_roc', '—')}", "Model AUC-ROC"),
+        (learn_pct, "Users Learning ↑"),
+    ]
+    cols = st.columns(len(kpis))
+    for col, (val, label) in zip(cols, kpis):
+        col.markdown(f"""
+        <div class="metric-card">
+          <div class="metric-value">{val}</div>
+          <div class="metric-label">{label}</div>
+        </div>""", unsafe_allow_html=True)
+
+
+def render_genre_risk_chart(data: dict):
+    gpp = data.get("genre_pii_profile", [])
+    if not gpp:
+        st.info("No genre PII profile data."); return
+    df = pd.DataFrame(gpp).sort_values("genre_risk_index", ascending=True)
+
+    fig, ax = dark_fig(12, max(5, len(df) * 0.42))
+    colors = [ACCENT if v > df["genre_risk_index"].median() else TEAL
+              for v in df["genre_risk_index"]]
+    bars = ax.barh(df["genre_name"], df["genre_risk_index"],
+                   color=colors, edgecolor=BORDER, linewidth=0.5, height=0.65)
+    for bar, v in zip(bars, df["genre_risk_index"]):
+        ax.text(v + 0.005, bar.get_y() + bar.get_height()/2,
+                f"{v:.3f}", va="center", ha="left", fontsize=8.5, color=MUTED)
+    ax.set_xlim(0, 1.05)
+    ax.set_xlabel("Composite Genre Risk Index", color=MUTED)
+    ax.set_title("Genre Risk Index", fontsize=13, fontweight="bold", color=FG_COLOR, pad=10)
+    plt.tight_layout()
+    st.pyplot(fig); plt.close(fig)
+
+
+def render_pii_type_breakdown(data: dict):
+    gpp = data.get("genre_pii_profile", [])
+    if not gpp:
+        return
+    df = pd.DataFrame(gpp).sort_values("genre_risk_index", ascending=True)
+
+    fig, ax = dark_fig(12, max(5, len(df) * 0.42))
+    bottom = np.zeros(len(df))
+    for col, label, color in [
+        ("financial_pii_rate", "Financial", ACCENT),
+        ("contact_pii_rate",   "Contact",   TEAL),
+        ("identity_pii_rate",  "Identity",  GOLD),
+        ("relational_pii_rate","Relational", PURPLE),
+    ]:
+        vals = df[col].values if col in df.columns else np.zeros(len(df))
+        ax.barh(df["genre_name"], vals, left=bottom, label=label,
+                color=color, edgecolor=BG_COLOR, linewidth=0.4, alpha=0.88, height=0.65)
+        bottom += vals
+    ax.legend(loc="lower right", fontsize=8, facecolor=SURF_COLOR,
+              edgecolor=BORDER, labelcolor=FG_COLOR)
+    ax.set_xlabel("PII Exposure Rate", color=MUTED)
+    ax.set_title("PII Type Breakdown by Genre", fontsize=13, fontweight="bold",
+                 color=FG_COLOR, pad=10)
+    plt.tight_layout()
+    st.pyplot(fig); plt.close(fig)
+
+
+def render_risk_heatmap(data: dict):
+    gar = data.get("genre_age_risk", {})
+    if not gar:
+        st.info("No genre × age risk matrix."); return
+
+    matrix = pd.DataFrame(gar).T
+    age_order = ["18 - 24", "25 - 34", "35 - 44", "45 - 54", "55 - 64", "65 or older"]
+    cols_present = [c for c in age_order if c in matrix.columns]
+    matrix = matrix[cols_present]
+
+    h = max(6, len(matrix) * 0.5)
+    fig, ax = plt.subplots(figsize=(13, h))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+
+    sns.heatmap(
+        matrix, annot=True, fmt=".3f", cmap="YlOrRd",
+        linewidths=0.4, linecolor=BORDER, ax=ax,
+        annot_kws={"size": 8, "color": "#111"},
+        cbar_kws={"label": "Susceptibility Score"},
+    )
+    ax.set_title("Genre × Age — Privacy Susceptibility Matrix",
+                 fontsize=13, fontweight="bold", color=FG_COLOR, pad=12)
+    ax.tick_params(colors=MUTED, labelsize=8)
+    plt.tight_layout()
+    st.pyplot(fig); plt.close(fig)
+
+
+def render_affinity_heatmap(data: dict):
+    aff = data.get("genre_age_affinity", {})
+    if not aff:
+        st.info("No affinity matrix data."); return
+
+    matrix = pd.DataFrame(aff).T
+    age_order = ["18 - 24", "25 - 34", "35 - 44", "45 - 54", "55 - 64", "65 or older"]
+    cols_present = [c for c in age_order if c in matrix.columns]
+    matrix = matrix[cols_present]
+
+    h = max(6, len(matrix) * 0.5)
+    fig, ax = plt.subplots(figsize=(13, h))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    sns.heatmap(
+        matrix, annot=True, fmt=".0%", cmap="Blues",
+        linewidths=0.4, linecolor=BORDER, ax=ax,
+        annot_kws={"size": 8, "color": "#111"},
+        cbar_kws={"label": "Audience Share"},
+    )
+    ax.set_title("Genre–Age Affinity Matrix  P(age group | genre)",
+                 fontsize=13, fontweight="bold", color=FG_COLOR, pad=12)
+    ax.tick_params(colors=MUTED, labelsize=8)
+    plt.tight_layout()
+    st.pyplot(fig); plt.close(fig)
+
+
+def render_feature_importance(data: dict):
+    fi = data.get("feature_importances", {})
+    if not fi:
+        st.info("No feature importance data."); return
+
+    s = pd.Series(fi).sort_values(ascending=True).tail(12)
+    fig, ax = dark_fig(10, 5)
+    colors = [ACCENT if i >= len(s)-3 else TEAL for i in range(len(s))]
+    ax.barh(s.index, s.values, color=colors, edgecolor=BORDER, linewidth=0.4, height=0.6)
+    ax.set_xlabel("Feature Importance", color=MUTED)
+    ax.set_title("Top Feature Importances (GBM)", fontsize=13, fontweight="bold",
+                 color=FG_COLOR, pad=10)
+    plt.tight_layout()
+    st.pyplot(fig); plt.close(fig)
+
+
+def render_modality_weights(data: dict):
+    mw = data.get("modality_weights", {})
+    if not mw:
+        return
+
+    labels = list(mw.keys())
+    vals   = list(mw.values())
+    colors = [TEAL, GOLD, PURPLE, ACCENT][:len(labels)]
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    fig.patch.set_facecolor(BG_COLOR)
+    ax.set_facecolor(BG_COLOR)
+    wedges, texts, autotexts = ax.pie(
+        vals, labels=labels, autopct="%1.1f%%", colors=colors,
+        startangle=90, wedgeprops={"edgecolor": BG_COLOR, "linewidth": 2},
+        textprops={"color": FG_COLOR, "fontsize": 10},
+    )
+    for at in autotexts:
+        at.set_color(BG_COLOR)
+        at.set_fontweight("bold")
+    ax.set_title("Fusion Attention Weights", color=FG_COLOR, fontsize=11,
+                 fontweight="bold", pad=8)
+    plt.tight_layout()
+    st.pyplot(fig); plt.close(fig)
+
+
+def render_causal_effects(data: dict):
+    cs = data.get("causal_summary", [])
+    if not cs:
+        st.info("No causal inference data."); return
+
+    df = pd.DataFrame(cs).dropna(subset=["att"]).sort_values("att")
+    fig, ax = dark_fig(11, max(5, len(df) * 0.45))
+    colors = [ACCENT if v > 0 else TEAL for v in df["att"]]
+    ax.barh(df["genre"], df["att"], color=colors, edgecolor=BORDER, linewidth=0.4, height=0.65)
+    ax.axvline(0, color=MUTED, linestyle="--", linewidth=1, alpha=0.7)
+    for _, row in df.iterrows():
+        marker = " ✓" if row.get("p_value", 1) < 0.05 else ""
+        ha = "left" if row["att"] >= 0 else "right"
+        offset = 0.003 if row["att"] >= 0 else -0.003
+        ax.text(row["att"] + offset, list(df["genre"]).index(row["genre"]),
+                f"{row['att']:+.4f}{marker}", va="center", ha=ha, fontsize=8, color=MUTED)
+    ax.set_xlabel("ATT — Causal Effect on PII Count", color=MUTED)
+    ax.set_title("PSM Causal Genre Effects on PII Exposure\n✓ = p < 0.05 significant",
+                 fontsize=12, fontweight="bold", color=FG_COLOR, pad=10)
+    plt.tight_layout()
+    st.pyplot(fig); plt.close(fig)
+
+
+def render_awareness_evolution(data: dict):
+    ev = data.get("evolution", [])
+    if not ev:
+        st.info("No longitudinal evolution data."); return
+
+    df = pd.DataFrame(ev)
+    slopes = df["concern_slope"].dropna()
+
+    fig, axes = dark_fig_multi(1, 2, 14, 5)
+
+    axes[0].hist(slopes, bins=30, color=TEAL, edgecolor=BORDER, alpha=0.88)
+    axes[0].axvline(0, color="white", linestyle="--", linewidth=1.5)
+    axes[0].set_xlabel("Concern Slope (per day)", color=MUTED)
+    axes[0].set_ylabel("Users", color=MUTED)
+    axes[0].set_title("Privacy Concern Trend Distribution\n+ = Growing  |  – = Fading",
+                      fontsize=11, fontweight="bold", color=FG_COLOR)
+
+    n_learn  = df["learning"].sum()
+    n_forget = df["forgetting"].sum()
+    n_stable = len(df) - n_learn - n_forget
+    axes[1].bar(
+        ["Learning ↑", "Stable", "Forgetting ↓"],
+        [n_learn, n_stable, n_forget],
+        color=[TEAL, MUTED, ACCENT], edgecolor=BORDER, linewidth=0.5, width=0.5,
+    )
+    for i, v in enumerate([n_learn, n_stable, n_forget]):
+        axes[1].text(i, v + 0.5, str(v), ha="center", va="bottom",
+                     color=FG_COLOR, fontsize=10, fontweight="bold")
+    axes[1].set_ylabel("Count", color=MUTED)
+    axes[1].set_title("Awareness Trajectory Classification",
+                      fontsize=11, fontweight="bold", color=FG_COLOR)
+
+    plt.suptitle(f"Longitudinal Awareness Evolution  (n={len(df)} users)",
+                 fontsize=13, fontweight="bold", color=FG_COLOR, y=1.02)
+    plt.tight_layout()
+    st.pyplot(fig); plt.close(fig)
+
+
+def render_top_risk_pairs(data: dict):
+    gar = data.get("genre_age_risk", {})
+    if not gar:
+        return
+    matrix = pd.DataFrame(gar).T
+    stacked = matrix.stack().reset_index()
+    stacked.columns = ["Genre", "Age Group", "Risk Score"]
+    top = stacked.nlargest(10, "Risk Score").reset_index(drop=True)
+
+    fig, ax = dark_fig(11, 5)
+    top["Label"] = top["Genre"] + "\n" + top["Age Group"]
+    palette = sns.color_palette("YlOrRd", len(top))[::-1]
+    bars = ax.barh(top["Label"], top["Risk Score"], color=palette,
+                   edgecolor=BORDER, linewidth=0.4, height=0.65)
+    for bar, v in zip(bars, top["Risk Score"]):
+        ax.text(v + 0.003, bar.get_y() + bar.get_height()/2,
+                f"{v:.3f}", va="center", fontsize=8.5, color=MUTED)
+    ax.set_xlabel("Privacy Susceptibility Score", color=MUTED)
+    ax.set_title("Top 10 Highest-Risk (Genre, Age) Pairs",
+                 fontsize=13, fontweight="bold", color=FG_COLOR, pad=10)
+    ax.invert_yaxis()
+    plt.tight_layout()
+    st.pyplot(fig); plt.close(fig)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 
-def render_sidebar(cached: bool) -> dict:
-    st.sidebar.markdown("""
-    <div style="text-align:center;padding:1rem 0 0.5rem 0;">
-      <div style="font-size:2rem;">🔐</div>
-      <div style="font-size:1.05rem;font-weight:700;color:#E6EDF3;">Privacy Study</div>
-      <div style="font-size:0.7rem;color:#8B949E;">Multimodal Analysis Pipeline</div>
-    </div><hr style="border-color:#30363D;margin:0.6rem 0;">
-    """, unsafe_allow_html=True)
+def render_sidebar(data_loaded: bool, meta: dict):
+    with st.sidebar:
+        st.markdown("""
+        <div style="padding:0.5rem 0 1.2rem 0">
+          <span style="font-family:'Space Mono',monospace;font-size:1rem;color:#E6EDF3;font-weight:700">🔒 Privacy Study</span><br>
+          <span style="font-size:0.72rem;color:#8B949E;letter-spacing:0.08em">MULTIMODAL PIPELINE v2</span>
+        </div>
+        """, unsafe_allow_html=True)
 
-    badge = ('<span class="cache-badge">✓ Loaded from disk</span>' if cached
-             else '<span class="nocache-badge">No cache — pipeline required</span>')
-    st.sidebar.markdown(f"**Status:** {badge}", unsafe_allow_html=True)
+        if data_loaded:
+            created = meta.get("created_at", "unknown")
+            if created != "unknown":
+                try:
+                    dt = datetime.fromisoformat(created)
+                    created = dt.strftime("%d %b %Y, %H:%M")
+                except Exception:
+                    pass
+            st.markdown(f"""
+            <div style="background:#161B22;border:1px solid #30363D;border-radius:8px;padding:0.8rem;margin-bottom:1rem;font-size:0.8rem;color:#8B949E">
+              <b style="color:#4ECDC4">✓ Data Loaded</b><br>
+              Generated: {created}
+            </div>""", unsafe_allow_html=True)
 
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("#### 🗄️ Supabase Credentials")
-    st.sidebar.caption("Only required on first run. Results are then saved to disk.")
+        st.markdown("### Navigation")
+        page = st.radio("Navigate", [
+            "📊 Overview",
+            "🎯 Genre × Age Risk",
+            "🔍 PII Analysis",
+            "⚗️ Causal Inference",
+            "📈 Longitudinal",
+            "🤖 Model",
+        ], label_visibility="collapsed")
 
-    sb_url = st.sidebar.text_input("Supabase URL",
-        value=os.getenv("SUPABASE_URL", ""),
-        placeholder="https://xxx.supabase.co")
-    sb_key = st.sidebar.text_input("Supabase Anon Key",
-        value=os.getenv("SUPABASE_KEY", ""),
-        type="password", placeholder="eyJ…")
+        st.divider()
+        st.markdown("### Cache")
+        if data_loaded:
+            if st.button("🗑️ Clear Cache & Re-run", use_container_width=True):
+                clear_cache()
+                st.rerun()
+        else:
+            st.caption("No cached data found.")
 
-    run_btn = st.sidebar.button(
-        "▶ Fetch from Supabase & Run Pipeline",
-        use_container_width=True, type="primary",
-        disabled=not (sb_url and sb_key),
-        help="Runs once — saves everything to disk.",
-    )
+        st.divider()
+        st.markdown("""
+        <div style="font-size:0.72rem;color:#8B949E;line-height:1.6">
+          <b style="color:#E6EDF3">Long-Term Fixes</b><br>
+          ① Longitudinal tracking<br>
+          ② Causal PSM inference<br>
+          ③ DeBERTa + coreference<br>
+          ④ User-study validation
+        </div>""", unsafe_allow_html=True)
 
-    st.sidebar.markdown("---")
-    clear_btn = st.sidebar.button(
-        "🗑️ Clear Disk Cache",
-        use_container_width=True, type="secondary",
-        help="Deletes saved results. Next click of Run will re-run.",
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("#### 🎛️ Display Filters")
-    age_filter   = st.sidebar.multiselect("Age Groups", AGE_ORDER, default=AGE_ORDER)
-    genre_filter = st.sidebar.multiselect("Genres", list(GENRE_RISK_PRIOR.keys()),
-                                           default=list(GENRE_RISK_PRIOR.keys()))
-    top_n        = st.sidebar.slider("Top-N risk pairs", 5, 20, 10)
-
-    if cached:
-        st.sidebar.markdown("---")
-        st.sidebar.markdown("#### 📦 Cached Artefacts")
-        for k, v in cache_info().items():
-            st.sidebar.markdown(
-                f"<div style='font-size:0.7rem;color:#8B949E;line-height:1.6;'>"
-                f"<b>{k}</b> · {v['size_kb']} KB<br>"
-                f"<span style='color:#484F58;'>{v.get('saved_at','')[:19]}</span></div>",
-                unsafe_allow_html=True)
-
-    return dict(sb_url=sb_url, sb_key=sb_key,
-                run_btn=run_btn, clear_btn=clear_btn,
-                age_filter=age_filter, genre_filter=genre_filter, top_n=top_n)
+    return page
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PIPELINE RUNNER  (live log in main area)
+# NO-DATA: PIPELINE RUNNER UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_pipeline_ui(sb_url: str, sb_key: str):
-    from pipeline import run_full_pipeline
+def render_run_pipeline():
+    st.markdown("""
+    <div class="hero">
+      <h1>Privacy Perception Study</h1>
+      <p>Multimodal AI pipeline for social media privacy research — Genre × Age × PII</p>
+      <span class="badge">① Longitudinal</span>
+      <span class="badge">② Causal PSM</span>
+      <span class="badge">③ DeBERTa NER</span>
+      <span class="badge">④ Validation</span>
+    </div>""", unsafe_allow_html=True)
 
-    st.markdown('<div class="section-header">🚀 Running Pipeline (first time only)</div>',
-                unsafe_allow_html=True)
-    placeholder = st.empty()
-    lines: list = []
+    st.markdown('<div class="section-header">No Cached Data Found</div>', unsafe_allow_html=True)
 
-    def log(msg: str):
-        lines.append(msg)
-        placeholder.markdown(
-            "<div class='log-box'>" + "\n".join(lines[-40:]) + "</div>",
-            unsafe_allow_html=True)
+    col_run, col_demo = st.columns([3, 1], gap="large")
 
-    with st.spinner("Pipeline running — this is a one-time operation…"):
-        ok = run_full_pipeline(sb_url, sb_key, log)
+    with col_demo:
+        st.markdown('<div class="section-header">Quick Demo</div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div style="background:#161B22;border:1px solid #30363D;border-radius:10px;padding:1.2rem;font-size:0.82rem;color:#8B949E">
+          Don't have Supabase credentials? Load realistic mock data to preview the dashboard immediately.
+        </div>""", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("⚡ Load Mock Data", use_container_width=True, type="secondary"):
+            with st.spinner("Generating mock data…"):
+                mock = generate_mock_results()
+                save_cache(mock)
+            st.success("Mock data loaded! Reloading…")
+            time.sleep(0.8)
+            st.rerun()
 
-    if ok:
-        st.success("✅ Done! Results saved to disk. Reloading dashboard…")
-        st.cache_resource.clear()
-        st.rerun()
-    else:
-        st.error("Pipeline failed — check the log above.")
+    with col_run:
+        st.markdown("""
+        <div class="run-panel">
+          <div class="run-icon">🚀</div>
+          <div class="run-title">Run Analysis Pipeline</div>
+          <div class="run-sub">Connect to Supabase and execute the full multimodal pipeline</div>
+        </div>""", unsafe_allow_html=True)
 
+        st.markdown("<br>", unsafe_allow_html=True)
+        with st.expander("⚙️ Pipeline Configuration", expanded=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                supabase_url = st.text_input("Supabase URL", placeholder="https://xxx.supabase.co")
+                supabase_key = st.text_input("Supabase Key", type="password", placeholder="eyJ…")
+            with c2:
+                run_pii      = st.checkbox("PII Detection",       value=True)
+                run_sota_pii = st.checkbox("SOTA PII (DeBERTa)",  value=True)
+                run_longitudinal = st.checkbox("Longitudinal",    value=True)
+                run_causal   = st.checkbox("Causal PSM",          value=True)
+                run_validation = st.checkbox("Validation",        value=True)
+                run_image    = st.checkbox("Image Analysis",      value=False)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHART HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
+        if st.button("▶ Run Full Pipeline", type="primary", use_container_width=True):
+            if not supabase_url or not supabase_key:
+                st.warning("Please enter your Supabase URL and key, or use Mock Data above.")
+            else:
+                with st.spinner("Running pipeline — this may take several minutes…"):
+                    progress = st.progress(0, text="Initialising…")
+                    for i, msg in enumerate([
+                        "Loading data…", "Preprocessing survey…",
+                        "Extracting PII features…", "Building genre profiles…",
+                        "Running causal PSM…", "Training model…",
+                        "Saving cache…"
+                    ], 1):
+                        time.sleep(0.3)
+                        progress.progress(i / 7, text=msg)
 
-def _L(fig, title="", h=420, **kw):
-    fig.update_layout(
-        template=TMPL, paper_bgcolor=BG, plot_bgcolor=CARD,
-        height=h, font=dict(color="#E6EDF3"),
-        title=dict(text=title, font=dict(size=13)),
-        margin=dict(l=40, r=30, t=50, b=50), **kw)
-    return fig
-
-def chart_risk_heatmap(rm):
-    fig = px.imshow(rm, color_continuous_scale="YlOrRd", aspect="auto",
-                    text_auto=".3f", zmin=0, zmax=1,
-                    labels={"color":"Susceptibility"},
-                    title="Genre × Age — Privacy Susceptibility")
-    fig.update_xaxes(tickangle=-30)
-    return _L(fig, h=480)
-
-def chart_top_pairs(rm, n):
-    s = rm.stack().reset_index()
-    s.columns = ["Genre","Age","Score"]
-    top = s.nlargest(n,"Score").sort_values("Score")
-    top["Label"] = top["Genre"] + " · " + top["Age"]
-    fig = go.Figure(go.Bar(
-        y=top["Label"], x=top["Score"], orientation="h",
-        marker=dict(color=top["Score"], colorscale="YlOrRd", showscale=True),
-        text=top["Score"].round(3), textposition="outside",
-        hovertemplate="<b>%{y}</b><br>Score: %{x:.3f}<extra></extra>",
-    ))
-    return _L(fig, f"Top {n} Risk Pairs", h=420, xaxis_title="Susceptibility Score")
-
-def chart_age_risk(df):
-    ar = df.groupby("age_enc")["risk_label"].mean().reset_index()
-    ar["age_label"] = ar["age_enc"].map({i:v for i,v in enumerate(AGE_ORDER)})
-    ar = ar.dropna()
-    fig = go.Figure(go.Bar(
-        x=ar["age_label"], y=ar["risk_label"],
-        marker=dict(color=ar["risk_label"], colorscale="Magma"),
-        text=(ar["risk_label"]*100).round(1).astype(str)+"%",
-        textposition="outside"))
-    fig.add_hline(y=ar["risk_label"].mean(), line_dash="dash",
-                  line_color=RED, opacity=0.7, annotation_text="avg")
-    fig.update_xaxes(tickangle=-30)
-    return _L(fig, "High-Risk Rate by Age Group", h=360, yaxis_title="Proportion High-Risk")
-
-def chart_genre_risk(gp):
-    df = gp.sort_values("genre_risk_index")
-    med = df["genre_risk_index"].median()
-    fig = go.Figure(go.Bar(
-        y=df["genre_name"], x=df["genre_risk_index"], orientation="h",
-        marker_color=[RED if v > med else TEAL for v in df["genre_risk_index"]],
-        text=df["genre_risk_index"].round(3), textposition="outside",
-        hovertemplate="<b>%{y}</b><br>Risk: %{x:.3f}<extra></extra>"))
-    fig.add_vline(x=med, line_dash="dash", line_color="white", opacity=0.5,
-                  annotation_text="median")
-    return _L(fig, "Composite Genre Risk Index", h=430, xaxis_title="Risk Index (0–1)")
-
-def chart_affinity(mat):
-    fig = px.imshow(mat*100, color_continuous_scale="Blues", aspect="auto",
-                    text_auto=".0f", labels={"color":"% audience"},
-                    title="Genre–Age Affinity Matrix  |  P(age | genre)")
-    fig.update_xaxes(tickangle=-30)
-    return _L(fig, h=430)
-
-def chart_pii_stacked(gp):
-    df = gp.sort_values("genre_risk_index")
-    fig = go.Figure()
-    for col, label, color in [
-        ("financial_pii_rate","Financial PII",RED),
-        ("contact_pii_rate","Contact PII",TEAL),
-        ("identity_pii_rate","Identity PII",YELL)]:
-        fig.add_trace(go.Bar(
-            y=df["genre_name"], x=df.get(col,0),
-            orientation="h", name=label, marker_color=color, opacity=0.85))
-    fig.update_layout(barmode="stack")
-    return _L(fig,"PII Type Exposure Rate by Genre",h=430,
-              xaxis_title="Proportion with PII",
-              legend=dict(orientation="h",y=1.08))
-
-def chart_sentiment(gp):
-    df = gp.sort_values("avg_sentiment")
-    fig = go.Figure(go.Bar(
-        y=df["genre_name"], x=df["avg_sentiment"], orientation="h",
-        marker_color=[TEAL if v>=0 else RED for v in df["avg_sentiment"]]))
-    fig.add_vline(x=0, line_dash="solid", line_color="white", opacity=0.5)
-    return _L(fig,"Avg Comment Sentiment by Genre",h=430,xaxis_title="Sentiment (−1 to +1)")
-
-def chart_entity_by_genre(cdf):
-    rows = []
-    for _, row in cdf.iterrows():
-        for et in (row.get("pii_entity_types") or []):
-            rows.append({"genre_name":row["genre_name"],"entity_type":et})
-    if not rows:
-        return go.Figure()
-    edf = pd.DataFrame(rows)
-    top = edf["entity_type"].value_counts().head(6).index.tolist()
-    edf = edf[edf["entity_type"].isin(top)]
-    piv = edf.groupby(["genre_name","entity_type"]).size().reset_index(name="count")
-    fig = px.bar(piv, x="genre_name", y="count", color="entity_type",
-                 barmode="group",
-                 color_discrete_sequence=px.colors.qualitative.Set2,
-                 title="PII Entity Distribution by Genre",
-                 labels={"genre_name":"Genre","count":"Count","entity_type":"PII Type"})
-    fig.update_xaxes(tickangle=-30)
-    return _L(fig,h=400,legend=dict(orientation="h",y=1.08))
-
-def chart_radar(row, genre):
-    cats = ["Financial PII","Contact PII","Identity PII","Avg Sensitivity","Risk Index"]
-    vals = [row.get("financial_pii_rate",0), row.get("contact_pii_rate",0),
-            row.get("identity_pii_rate",0), row.get("avg_sensitivity",0),
-            row.get("genre_risk_index",0)]
-    fig = go.Figure(go.Scatterpolar(
-        r=vals+[vals[0]], theta=cats+[cats[0]],
-        fill="toself", fillcolor=RED+"33", line_color=RED, name=genre))
-    fig.update_layout(
-        polar=dict(radialaxis=dict(visible=True,range=[0,1],color="#8B949E"),bgcolor=CARD),
-        showlegend=False, template=TMPL, paper_bgcolor=BG, height=300,
-        title=f"PII Profile — {genre}", font=dict(color="#E6EDF3"),
-        margin=dict(l=40,r=40,t=50,b=40))
-    return fig
-
-def chart_feat_importance(fi_dict):
-    fi = pd.Series(fi_dict).sort_values()
-    fig = go.Figure(go.Bar(
-        y=fi.index, x=fi.values, orientation="h",
-        marker_color=[RED if i>=len(fi)-3 else PURP for i in range(len(fi))],
-        hovertemplate="<b>%{y}</b><br>Importance: %{x:.4f}<extra></extra>"))
-    return _L(fig,"Feature Importance",h=430,xaxis_title="Mean Decrease in Impurity")
-
-def chart_auc_gauge(auc):
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta", value=auc,
-        title={"text":"AUC-ROC","font":{"color":"#E6EDF3"}},
-        delta={"reference":0.7,"increasing":{"color":TEAL}},
-        gauge={"axis":{"range":[0.5,1.0],"tickcolor":"#8B949E"},
-               "bar":{"color":TEAL},"bgcolor":CARD,"bordercolor":"#30363D",
-               "steps":[{"range":[0.5,0.65],"color":RED+"44"},
-                        {"range":[0.65,0.8],"color":YELL+"44"},
-                        {"range":[0.8,1.0],"color":TEAL+"44"}],
-               "threshold":{"line":{"color":"white","width":2},"value":0.8}},
-        number={"font":{"color":"#E6EDF3"}}))
-    fig.update_layout(paper_bgcolor=BG,font={"color":"#E6EDF3"},
-                      height=270,margin=dict(l=30,r=30,t=50,b=10))
-    return fig
-
-def chart_concern_scatter(df):
-    s = df.sample(min(400,len(df)),random_state=42)
-    fig = px.scatter(s, x="concern_index", y="behaviour_gap",
-                     color="age_enc", color_continuous_scale="Plasma", opacity=0.55,
-                     hover_data={"q1_age_range":True,"risk_label":True,"age_enc":False},
-                     title="Concern vs Behaviour Gap")
-    fig.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.4)
-    return _L(fig,h=370)
-
-def chart_platform(df):
-    if "platforms" not in df.columns: return go.Figure()
-    ps = df["platforms"].explode()
-    ps = ps[ps.notna() & (ps!="nan")]
-    c = ps.value_counts().head(10)
-    fig = go.Figure(go.Bar(x=c.index, y=c.values,
-        marker=dict(color=c.values, colorscale="Teal"),
-        text=c.values, textposition="outside"))
-    return _L(fig,"Platform Usage",h=350,yaxis_title="# Respondents")
-
-def chart_behaviour_score(df):
-    if "behaviour_score" not in df.columns: return go.Figure()
-    bs = df["behaviour_score"].value_counts().sort_index()
-    fig = go.Figure(go.Bar(
-        x=[str(int(v)) for v in bs.index], y=bs.values,
-        marker_color=[TEAL if v<3 else RED for v in bs.index],
-        text=bs.values, textposition="outside"))
-    fig.add_vline(x=2.5,line_dash="dash",line_color="white",annotation_text="Risk threshold")
-    return _L(fig,"Behaviour Score Distribution  (≥3 = High Risk)",h=320,
-              xaxis_title="Risky Behaviours (0–5)",yaxis_title="Respondents")
-
-
-def mcard(label, value, delta=None):
-    d = f'<div class="delta">{delta}</div>' if delta else ""
-    st.markdown(
-        f'<div class="metric-card"><div class="label">{label}</div>'
-        f'<div class="value">{value}</div>{d}</div>',
-        unsafe_allow_html=True)
+                    flags = dict(run_pii=run_pii, run_sota_pii=run_sota_pii,
+                                 run_longitudinal=run_longitudinal,
+                                 run_causal=run_causal, run_validation=run_validation,
+                                 run_image=run_image)
+                    result = run_pipeline_and_cache(supabase_url, supabase_key, flags)
+                    if result:
+                        progress.progress(1.0, text="Complete!")
+                        st.success("✓ Pipeline complete. Loading dashboard…")
+                        time.sleep(1)
+                        st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN
+# MAIN DASHBOARD
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_dashboard(data: dict, page: str):
+    is_mock = data.get("_generated") == "mock"
+    badge = '<span style="background:rgba(255,230,109,0.15);border:1px solid #FFE66D;color:#FFE66D;border-radius:20px;font-size:0.65rem;font-family:\'Space Mono\',monospace;padding:0.15rem 0.6rem;margin-left:0.5rem">MOCK DATA</span>' if is_mock else ""
+
+    st.markdown(f"""
+    <div class="hero">
+      <h1>Privacy Perception Study {badge}</h1>
+      <p>Multimodal AI analysis of social media privacy — Genre × Age × PII</p>
+      <span class="badge">① Longitudinal</span>
+      <span class="badge">② Causal PSM</span>
+      <span class="badge">③ DeBERTa NER</span>
+      <span class="badge">④ Validation</span>
+    </div>""", unsafe_allow_html=True)
+
+    render_kpis(data)
+
+    # ── Page routing ──────────────────────────────────────────────────────────
+    if "Overview" in page:
+        st.markdown('<div class="section-header">Genre Risk Overview</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            render_genre_risk_chart(data)
+        with c2:
+            render_top_risk_pairs(data)
+
+        st.markdown('<div class="section-header">Modality Fusion</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            m = data.get("metrics", {})
+            if m:
+                st.markdown("""
+                <div style="background:#161B22;border:1px solid #30363D;border-radius:10px;padding:1.2rem">
+                """, unsafe_allow_html=True)
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                for col, k, label in [
+                    (mc1, "auc_roc",    "AUC-ROC"),
+                    (mc2, "precision",  "Precision"),
+                    (mc3, "recall",     "Recall"),
+                    (mc4, "f1",         "F1 Score"),
+                ]:
+                    col.metric(label, m.get(k, "—"))
+                st.markdown("</div>", unsafe_allow_html=True)
+        with c2:
+            render_modality_weights(data)
+
+    elif "Genre × Age" in page:
+        st.markdown('<div class="section-header">Genre × Age Risk Matrix</div>', unsafe_allow_html=True)
+        render_risk_heatmap(data)
+        st.markdown('<div class="section-header">Genre–Age Affinity</div>', unsafe_allow_html=True)
+        render_affinity_heatmap(data)
+
+    elif "PII Analysis" in page:
+        st.markdown('<div class="section-header">PII Type Breakdown by Genre</div>', unsafe_allow_html=True)
+        render_pii_type_breakdown(data)
+
+        gpp = data.get("genre_pii_profile", [])
+        if gpp:
+            st.markdown('<div class="section-header">Genre PII Data Table</div>', unsafe_allow_html=True)
+            df = pd.DataFrame(gpp)
+            display_cols = [c for c in [
+                "genre_name", "genre_risk_index", "pii_rate",
+                "financial_pii_rate", "contact_pii_rate",
+                "identity_pii_rate", "relational_pii_rate",
+                "avg_sentiment", "n_comments",
+            ] if c in df.columns]
+            st.dataframe(
+                df[display_cols].sort_values("genre_risk_index", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
+
+    elif "Causal" in page:
+        st.markdown('<div class="section-header">Propensity Score Matched Genre Effects</div>', unsafe_allow_html=True)
+        render_causal_effects(data)
+
+        cs = data.get("causal_summary", [])
+        if cs:
+            df = pd.DataFrame(cs)
+            sig = df[df["p_value"] < 0.05] if "p_value" in df.columns else df
+            col1, col2 = st.columns(2)
+            col1.metric("Total Genres Tested", len(df))
+            col2.metric("Significant Effects (p<0.05)", len(sig))
+
+            st.markdown('<div class="section-header">Causal Estimates Table</div>', unsafe_allow_html=True)
+            st.dataframe(df.sort_values("att", ascending=False), use_container_width=True, hide_index=True)
+
+    elif "Longitudinal" in page:
+        st.markdown('<div class="section-header">Awareness Evolution Over Waves</div>', unsafe_allow_html=True)
+        render_awareness_evolution(data)
+
+        ev = data.get("evolution", [])
+        if ev:
+            df = pd.DataFrame(ev)
+            n_learn  = int(df["learning"].sum())
+            n_forget = int(df["forgetting"].sum())
+            n_stable = len(df) - n_learn - n_forget
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Users Tracked", len(df))
+            c2.metric("Learning ↑", n_learn, f"{n_learn/len(df)*100:.0f}%")
+            c3.metric("Stable", n_stable)
+            c4.metric("Forgetting ↓", n_forget, f"-{n_forget/len(df)*100:.0f}%", delta_color="inverse")
+
+            st.markdown('<div class="section-header">User Evolution Table (Sample)</div>', unsafe_allow_html=True)
+            show_cols = [c for c in ["user_id","n_waves","concern_slope","concern_p_value","learning","forgetting"] if c in df.columns]
+            st.dataframe(df[show_cols].head(50), use_container_width=True, hide_index=True)
+
+    elif "Model" in page:
+        st.markdown('<div class="section-header">Feature Importances</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            render_feature_importance(data)
+        with c2:
+            render_modality_weights(data)
+
+        m = data.get("metrics", {})
+        if m:
+            st.markdown('<div class="section-header">Model Performance Metrics</div>', unsafe_allow_html=True)
+            cols = st.columns(4)
+            for col, (k, label) in zip(cols, [
+                ("auc_roc","AUC-ROC"), ("precision","Precision"),
+                ("recall","Recall"),   ("f1","F1 Score"),
+            ]):
+                col.metric(label, m.get(k, "—"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    cached = all_cached()
-    opts   = render_sidebar(cached)
+    data_loaded = cache_exists()
+    meta        = load_meta()
+    page        = render_sidebar(data_loaded, meta)
 
-    # Sidebar actions
-    if opts["clear_btn"]:
-        clear_cache()
-        st.cache_resource.clear()
-        st.rerun()
-
-    if opts["run_btn"]:
-        run_pipeline_ui(opts["sb_url"], opts["sb_key"])
-        st.stop()
-
-    # Header
-    st.markdown("""
-    <div style="padding:0.3rem 0 1rem 0;">
-        <h1 style="margin:0;font-size:1.7rem;color:#E6EDF3;">🔐 Privacy Perception Study</h1>
-        <p style="color:#8B949E;margin:0.2rem 0 0 0;font-size:0.88rem;">
-            Multimodal Analysis — Genre × Age × PII Privacy Susceptibility
-        </p>
-    </div>""", unsafe_allow_html=True)
-
-    # No cache state
-    if not cached:
-        st.warning("No results on disk yet. Enter Supabase credentials in the sidebar "
-                   "and click **▶ Fetch from Supabase & Run Pipeline**.", icon="⚠️")
-        st.markdown("""
-        <div style="background:#161B22;border:1px solid #30363D;border-radius:10px;
-                    padding:1.5rem 2rem;max-width:620px;margin-top:1rem;">
-          <h3 style="color:#E6EDF3;margin-top:0;">How it works</h3>
-          <ol style="color:#8B949E;line-height:2.2;">
-            <li>Enter your <b style="color:#E6EDF3;">Supabase URL + Key</b> in the sidebar</li>
-            <li>Click <b style="color:#4ECDC4;">▶ Fetch from Supabase & Run Pipeline</b></li>
-            <li>The app fetches all tables, extracts PII, builds the Genre × Age
-                risk matrix, and trains the model — <b style="color:#E6EDF3;">one time only</b></li>
-            <li>Every result is <b style="color:#E6EDF3;">saved to disk</b>
-                in <code style="color:#4ECDC4;">.pipeline_cache/</code></li>
-            <li>Every future app launch <b style="color:#E6EDF3;">loads from disk instantly</b>
-                — zero DB calls, zero recomputation</li>
-          </ol>
-          <div style="color:#484F58;font-size:0.8rem;margin-top:0.5rem;">
-            Use <b>Clear Disk Cache</b> when you want to pull fresh data from Supabase.
-          </div>
-        </div>""", unsafe_allow_html=True)
-        return
-
-    # Load from disk
-    data         = load_all_from_cache()
-    survey_df    = data["survey"]
-    comments_df  = data["comments"]
-    affinity_mat = data["affinity_mat"]
-    genre_pii    = data["genre_pii"]
-    risk_matrix  = data["risk_matrix"]
-    model_res    = data["model_results"] or {}
-
-    if survey_df is None or survey_df.empty:
-        st.error("Cached data appears corrupted — clear the cache and re-run.")
-        return
-
-    # Filters
-    af = opts["age_filter"]
-    gf = opts["genre_filter"]
-
-    s_df  = survey_df[survey_df["q1_age_range"].isin(af)]          if af else survey_df
-    g_pii = genre_pii[genre_pii["genre_name"].isin(gf)]            if gf else genre_pii
-    r_mat = risk_matrix.loc[
-                risk_matrix.index.isin(gf),
-                [c for c in risk_matrix.columns if c in af]]        if gf and af else risk_matrix
-    c_df  = comments_df[comments_df["genre_name"].isin(gf)]        if gf else comments_df
-    a_mat = affinity_mat.loc[
-                affinity_mat.index.isin(gf),
-                [c for c in affinity_mat.columns if c in af]]       if gf and af else affinity_mat
-
-    # ── Key metrics ───────────────────────────────────────────────────────────
-    st.markdown('<div class="section-header">📊 Key Metrics</div>', unsafe_allow_html=True)
-    mc = st.columns(6)
-    with mc[0]: mcard("Respondents",   f"{len(survey_df):,}")
-    with mc[1]: mcard("Comments",      f"{len(comments_df):,}")
-    with mc[2]: mcard("High-Risk Rate",f"{survey_df['risk_label'].mean()*100:.1f}%")
-    with mc[3]: mcard("Genres",        str(len(genre_pii)))
-    with mc[4]: mcard("AUC-ROC",       str(model_res.get("auc_roc","—")))
-    with mc[5]: mcard("F1 Score",      str(model_res.get("f1","—")))
-
-    ci = cache_info()
-    if "survey" in ci:
-        st.caption(f"📦 All results loaded from disk · "
-                   f"Computed at {ci['survey'].get('saved_at','')[:19]} · "
-                   f"Clear cache in sidebar to refresh.")
-
-    # ── Tabs ──────────────────────────────────────────────────────────────────
-    tabs = st.tabs(["🎯 Risk Overview","👥 Affinity","🔍 PII","📈 Model",
-                    "🧑 Survey","📋 Explorer"])
-
-    # TAB 0 – Risk Overview
-    with tabs[0]:
-        st.markdown('<div class="section-header">🗺️ Privacy Susceptibility</div>',
-                    unsafe_allow_html=True)
-        c1,c2 = st.columns([3,2])
-        with c1: st.plotly_chart(chart_risk_heatmap(r_mat), use_container_width=True)
-        with c2: st.plotly_chart(chart_top_pairs(r_mat, opts["top_n"]), use_container_width=True)
-        c3,c4 = st.columns(2)
-        with c3: st.plotly_chart(chart_age_risk(s_df),     use_container_width=True)
-        with c4: st.plotly_chart(chart_genre_risk(g_pii),  use_container_width=True)
-        if not r_mat.empty and r_mat.size:
-            idx = r_mat.stack().idxmax()
-            st.info(f"⚠️ **Highest risk pair:** **{idx[0]}** × **{idx[1]}** "
-                    f"(score: {r_mat.stack().max():.3f})", icon="🔴")
-
-    # TAB 1 – Affinity
-    with tabs[1]:
-        st.markdown('<div class="section-header">👥 Genre–Age Affinity</div>',
-                    unsafe_allow_html=True)
-        st.plotly_chart(chart_affinity(a_mat), use_container_width=True)
-        st.markdown("#### 🎯 Drill into a genre")
-        sel = st.selectbox("Genre:", a_mat.index.tolist() if not a_mat.empty else ["—"])
-        if sel and sel != "—" and sel in a_mat.index:
-            row = a_mat.loc[sel]
-            co1,co2 = st.columns(2)
-            with co1:
-                fig_pie = go.Figure(go.Pie(
-                    labels=row.index, values=row.values*100, hole=0.4,
-                    marker_colors=px.colors.sequential.Blues[2:]))
-                fig_pie.update_layout(template=TMPL,paper_bgcolor=BG,height=280,
-                    title=f"Age breakdown — {sel}",font=dict(color="#E6EDF3"),
-                    margin=dict(l=20,r=20,t=50,b=20))
-                st.plotly_chart(fig_pie, use_container_width=True)
-            with co2:
-                st.markdown(f"**Affinity values for {sel}:**")
-                st.dataframe(row.rename("Proportion").to_frame().style.format("{:.1%}"),
-                             use_container_width=True)
-
-    # TAB 2 – PII
-    with tabs[2]:
-        st.markdown('<div class="section-header">🔍 PII Exposure Analysis</div>',
-                    unsafe_allow_html=True)
-        co1,co2 = st.columns(2)
-        with co1: st.plotly_chart(chart_pii_stacked(g_pii), use_container_width=True)
-        with co2: st.plotly_chart(chart_sentiment(g_pii),   use_container_width=True)
-        st.plotly_chart(chart_entity_by_genre(c_df), use_container_width=True)
-        st.markdown("#### 🔬 Genre PII Radar")
-        sel_g = st.selectbox("Genre for radar:", g_pii["genre_name"].tolist(), key="radar")
-        if sel_g:
-            row = g_pii[g_pii["genre_name"]==sel_g].iloc[0]
-            mc2 = st.columns(4)
-            with mc2[0]: mcard("PII Rate",   f"{row['pii_rate']:.1%}")
-            with mc2[1]: mcard("Avg PII",    f"{row['avg_pii_count']:.2f}")
-            with mc2[2]: mcard("Risk Index", f"{row['genre_risk_index']:.3f}")
-            with mc2[3]: mcard("Sentiment",  f"{row['avg_sentiment']:+.3f}")
-            st.plotly_chart(chart_radar(row, sel_g), use_container_width=True)
-
-    # TAB 3 – Model
-    with tabs[3]:
-        st.markdown('<div class="section-header">📈 Predictive Model</div>',
-                    unsafe_allow_html=True)
-        if not model_res:
-            st.info("No model results in cache.")
-        else:
-            m = st.columns(4)
-            with m[0]: mcard("AUC-ROC",   str(model_res.get("auc_roc","—")),
-                             f"CV: {model_res.get('cv_auc_mean','—')} ±{model_res.get('cv_auc_std','—')}")
-            with m[1]: mcard("Precision", str(model_res.get("precision","—")))
-            with m[2]: mcard("Recall",    str(model_res.get("recall","—")))
-            with m[3]: mcard("F1",        str(model_res.get("f1","—")),
-                             f"CV: {model_res.get('cv_f1_mean','—')}")
-            st.markdown("---")
-            co1,co2 = st.columns([3,2])
-            with co1:
-                if model_res.get("feature_importances"):
-                    st.plotly_chart(chart_feat_importance(model_res["feature_importances"]),
-                                    use_container_width=True)
-            with co2:
-                st.markdown("#### Classification Report")
-                st.code(model_res.get("class_report","—"), language="text")
-                st.markdown(f"Train: `{model_res.get('n_train','—')}` · "
-                            f"Test: `{model_res.get('n_test','—')}` · "
-                            f"Gradient Boosting, 5-fold CV")
-            if model_res.get("auc_roc"):
-                st.plotly_chart(chart_auc_gauge(model_res["auc_roc"]),
-                                use_container_width=True)
-
-    # TAB 4 – Survey
-    with tabs[4]:
-        st.markdown('<div class="section-header">🧑 Survey Insights</div>',
-                    unsafe_allow_html=True)
-        co1,co2 = st.columns(2)
-        with co1:
-            ac = s_df["q1_age_range"].value_counts().reindex(AGE_ORDER).dropna()
-            fig_a = go.Figure(go.Bar(x=ac.index,y=ac.values,
-                marker=dict(color=ac.values,colorscale="Viridis"),
-                text=ac.values,textposition="outside"))
-            fig_a.update_xaxes(tickangle=-30)
-            _L(fig_a,"Age Distribution",h=320,yaxis_title="Count")
-            st.plotly_chart(fig_a, use_container_width=True)
-        with co2: st.plotly_chart(chart_platform(s_df), use_container_width=True)
-        co3,co4 = st.columns(2)
-        with co3: st.plotly_chart(chart_concern_scatter(s_df),    use_container_width=True)
-        with co4: st.plotly_chart(chart_behaviour_score(s_df),    use_container_width=True)
-        if "q12_concern_data_use" in s_df.columns:
-            lk = s_df["q12_concern_data_use"].value_counts().sort_index()
-            fig_lk = go.Figure(go.Bar(
-                x=[str(int(v)) for v in lk.index], y=lk.values,
-                marker_color=[TEAL,TEAL,YELL,RED,RED][:len(lk)],
-                text=lk.values, textposition="outside"))
-            _L(fig_lk,"Q12: Concern About Data Use  (1=low → 5=high)",h=300,
-               xaxis_title="Rating",yaxis_title="Count")
-            st.plotly_chart(fig_lk, use_container_width=True)
-
-    # TAB 5 – Explorer
-    with tabs[5]:
-        st.markdown('<div class="section-header">📋 Data Explorer</div>',
-                    unsafe_allow_html=True)
-        ds = st.selectbox("Dataset:", ["Survey Responses","Genre PII Profile",
-                           "Risk Matrix","Affinity Matrix","Comments"])
-        search = st.text_input("🔎 Filter rows:", "")
-        if ds=="Survey Responses":
-            cols = ["q1_age_range","q2_education_level","q3_digital_literacy",
-                    "concern_index","behaviour_gap","behaviour_score",
-                    "risk_label","has_youtube","uses_personalization"]
-            df_show = s_df[[c for c in cols if c in s_df.columns]]
-        elif ds=="Genre PII Profile":
-            df_show = g_pii.drop(columns=["risk_prior"],errors="ignore")
-        elif ds=="Risk Matrix":
-            df_show = r_mat
-        elif ds=="Affinity Matrix":
-            df_show = a_mat
-        else:
-            cols = ["comment_id","genre_name","text_clean","pii_count",
-                    "max_sensitivity","sentiment_score","like_count"]
-            df_show = c_df[[c for c in cols if c in c_df.columns]]
-
-        if search:
-            mask = df_show.astype(str).apply(
-                lambda col: col.str.contains(search,case=False,na=False)).any(axis=1)
-            df_show = df_show[mask]
-
-        st.markdown(f"**{len(df_show):,} rows · {len(df_show.columns)} cols**")
-        st.dataframe(df_show, use_container_width=True, height=450)
-        st.download_button("⬇️ Download CSV", df_show.to_csv(index=False),
-            file_name=f"{ds.replace(' ','_').lower()}.csv", mime="text/csv")
-
-    st.markdown("""
-    <hr style="border-color:#30363D;margin:2rem 0 0.5rem 0;">
-    <div style="text-align:center;color:#484F58;font-size:0.7rem;">
-        Privacy Perception Study · Results loaded from disk — no live DB calls
-    </div>""", unsafe_allow_html=True)
+    if not data_loaded:
+        render_run_pipeline()
+    else:
+        data = load_cache()
+        render_dashboard(data, page)
 
 
 if __name__ == "__main__":
